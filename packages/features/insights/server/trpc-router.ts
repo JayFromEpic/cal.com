@@ -49,11 +49,11 @@ const buildBaseWhereCondition = async ({
   isAll,
   ctx,
 }: BuildBaseWhereConditionType): Promise<{
-  whereCondition: Prisma.BookingTimeStatusWhereInput;
+  whereCondition: Prisma.BookingTimeStatusDenormalizedWhereInput;
   isEmptyResponse?: boolean;
 }> => {
-  let whereCondition: Prisma.BookingTimeStatusWhereInput = {};
-  const ANDConditions: Prisma.BookingTimeStatusWhereInput[] = [];
+  let whereCondition: Prisma.BookingTimeStatusDenormalizedWhereInput = {};
+  const ANDConditions: Prisma.BookingTimeStatusDenormalizedWhereInput[] = [];
   // EventType Filter
   if (eventTypeId) ANDConditions.push({ OR: [{ eventTypeId }, { eventParentId: eventTypeId }] });
   // User/Member filter
@@ -588,7 +588,7 @@ export const insightsRouter = router({
       },
     };
 
-    const bookingsFromSelected = await ctx.insightsDb.bookingTimeStatus.groupBy({
+    const bookingsFromSelected = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
       by: ["eventTypeId"],
       where: bookingWhere,
       _count: {
@@ -725,7 +725,7 @@ export const insightsRouter = router({
 
     const startOfEndOf = timeView === "year" ? "year" : timeView === "month" ? "month" : "week";
 
-    const allBookings = await ctx.insightsDb.bookingTimeStatus.findMany({
+    const allBookings = await ctx.insightsDb.bookingTimeStatusDenormalized.findMany({
       select: {
         eventLength: true,
         createdAt: true,
@@ -795,7 +795,7 @@ export const insightsRouter = router({
         status: "CANCELLED",
       };
 
-      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.groupBy({
+      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
         by: ["userId"],
         where: bookingWhere,
         _count: {
@@ -877,7 +877,7 @@ export const insightsRouter = router({
         },
       };
 
-      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.groupBy({
+      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
         by: ["userId"],
         where: bookingWhere,
         _count: {
@@ -958,7 +958,7 @@ export const insightsRouter = router({
         },
       };
 
-      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.groupBy({
+      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
         by: ["userId"],
         where: bookingWhere,
         _count: {
@@ -1255,7 +1255,7 @@ export const insightsRouter = router({
       ];
     }
 
-    const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.findMany({
+    const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.findMany({
       where: bookingWhere,
       orderBy: {
         endTime: "desc",
@@ -1334,7 +1334,7 @@ export const insightsRouter = router({
         noShowHost: true,
       };
 
-      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.groupBy({
+      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
         by: ["userId"],
         where: bookingWhere,
         _count: {
@@ -1413,7 +1413,7 @@ export const insightsRouter = router({
         rating: { not: null },
       };
 
-      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.groupBy({
+      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
         by: ["userId"],
         where: bookingWhere,
         _avg: {
@@ -1492,7 +1492,7 @@ export const insightsRouter = router({
         rating: { not: null },
       };
 
-      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatus.groupBy({
+      const bookingsFromTeam = await ctx.insightsDb.bookingTimeStatusDenormalized.groupBy({
         by: ["userId"],
         where: bookingWhere,
         _avg: {
