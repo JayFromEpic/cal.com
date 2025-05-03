@@ -1,4 +1,4 @@
-import type { DestinationCalendar } from "@prisma/client";
+import type { DestinationCalendar, SyncedToCalendar } from "@prisma/client";
 // eslint-disable-next-line no-restricted-imports
 import { cloneDeep } from "lodash";
 import short, { uuid } from "short-uuid";
@@ -110,6 +110,7 @@ import type { IEventTypePaymentCredentialType, Invitee, IsFixedAwareUser } from 
 import { validateBookingTimeIsNotOutOfBounds } from "./handleNewBooking/validateBookingTimeIsNotOutOfBounds";
 import { validateEventLength } from "./handleNewBooking/validateEventLength";
 import handleSeats from "./handleSeats/handleSeats";
+import { getBookingRequest } from "./requiresConfirmation/getBookingRequest";
 
 const translator = short();
 const log = logger.getSubLogger({ prefix: ["[api] book:user"] });
@@ -191,14 +192,18 @@ const buildDryRunBooking = ({
   allHostUsers: { id: number }[];
   isManagedEventType: boolean;
 }) => {
+  const sanitizedOrganizerUser = {
+    ...organizerUser,
+    credentials: undefined,
+  };
   const booking = {
     id: -101,
     uid: "DRY_RUN_UID",
     iCalUID: "DRY_RUN_ICAL_UID",
     status: BookingStatus.ACCEPTED,
     eventTypeId: eventTypeId,
-    user: organizerUser,
-    userId: organizerUser.id,
+    user: sanitizedOrganizerUser,
+    userId: sanitizedOrganizerUser.id,
     title: eventName,
     startTime: new Date(startTime),
     endTime: new Date(endTime),
@@ -328,6 +333,36 @@ export type BookingHandlerInput = {
   forcedSlug?: string;
 } & PlatformParams;
 
+/**
+ * Extracts data required to create SyncedToCalendar records from EventManager results.
+ * It uses the credentialId assumed to be present on successful calendar integration results.
+ *
+ * @param results - The results array from EventManager operations (create/reschedule), potentially containing credentialId.
+ * @param bookingId - The ID of the booking for logging purposes.
+ * @returns An array of data objects suitable for `prisma.syncedToCalendar.createMany.data`.
+ */
+const getSyncedToCalendarData = (
+  // Assuming EventResult might contain credentialId for successful calendar ops
+  results: EventResult<AdditionalInformation & { url?: string; iCalUID?: string; credentialId?: number }>[]
+  // Adjust Omit based on actual required fields for SyncedToCalendar creation, excluding relational keys like bookingId
+): Omit<SyncedToCalendar, "id" | "bookingId" | "createdAt" | "updatedAt"> => {
+  console.log("results in getSyncedToCalendarData", JSON.stringify(results, null, 2));
+  for (const result of results) {
+    // Check if it's a successful calendar integration result AND has a numeric credentialId
+    if (result.success && result.type.includes("_calendar")) {
+      // Structure based on SyncedToCalendar schema fields needed for creation (excluding bookingId)
+      // Assuming 'integration' and 'subscriptionId' are optional or have defaults for now
+      return {
+        externalCalendarId: result.externalId,
+        credentialId: result.credentialId,
+        integration: result.type, // Provide if required by schema
+      };
+    }
+  }
+
+  return null;
+};
+
 async function handler(
   input: BookingHandlerInput,
   bookingDataSchemaGetter: BookingDataSchemaGetter = getBookingDataSchema
@@ -413,15 +448,63 @@ async function handler(
     });
   }
 
-  const shouldServeCache = await getShouldServeCache(_shouldServeCache, eventType.team?.id);
+  const bookingSeat = reqBody.rescheduleUid ? await getSeatedBooking(reqBody.rescheduleUid) : null;
+  const rescheduleUid = bookingSeat ? bookingSeat.booking.uid : reqBody.rescheduleUid;
 
-  const isTeamEventType =
-    !!eventType.schedulingType && ["COLLECTIVE", "ROUND_ROBIN"].includes(eventType.schedulingType);
+  let originalRescheduledBooking = rescheduleUid
+    ? await getOriginalRescheduledBooking(rescheduleUid, !!eventType.seatsPerTimeSlot)
+    : null;
 
   const paymentAppData = getPaymentAppData({
     ...eventType,
     metadata: eventTypeMetaDataSchemaWithTypedApps.parse(eventType.metadata),
   });
+
+  const { userReschedulingIsOwner, isConfirmedByDefault } = await getRequiresConfirmationFlags({
+    eventType,
+    bookingStartTime: reqBody.start,
+    userId,
+    originalRescheduledBookingOrganizerId: originalRescheduledBooking?.user?.id,
+    paymentAppData,
+    bookerEmail,
+  });
+
+  // If a request already exists for the timeslot, return that request
+  if (!isConfirmedByDefault && !userReschedulingIsOwner) {
+    const requestedBooking = await getBookingRequest({
+      eventTypeId,
+      bookerEmail,
+      bookerPhoneNumber,
+      startTime: new Date(dayjs(reqBody.start).utc().format()),
+    });
+
+    if (requestedBooking) {
+      const bookingResponse = {
+        ...requestedBooking,
+        user: {
+          ...requestedBooking.user,
+          email: null,
+        },
+        paymentRequired: false,
+        seatReferenceUid: "",
+      };
+
+      return {
+        ...bookingResponse,
+        luckyUsers: bookingResponse.userId ? [bookingResponse.userId] : [],
+        isDryRun,
+        ...(isDryRun ? { troubleshooterData } : {}),
+        paymentUid: undefined,
+        paymentId: undefined,
+      };
+    }
+  }
+
+  const shouldServeCache = await getShouldServeCache(_shouldServeCache, eventType.team?.id);
+
+  const isTeamEventType =
+    !!eventType.schedulingType && ["COLLECTIVE", "ROUND_ROBIN"].includes(eventType.schedulingType);
+
   loggerWithEventDetails.info(
     `Booking eventType ${eventTypeId} started`,
     safeStringify({
@@ -535,13 +618,6 @@ async function handler(
     reqBodyStart: reqBody.start,
     reqBodyRescheduleUid: reqBody.rescheduleUid,
   });
-
-  const bookingSeat = reqBody.rescheduleUid ? await getSeatedBooking(reqBody.rescheduleUid) : null;
-  const rescheduleUid = bookingSeat ? bookingSeat.booking.uid : reqBody.rescheduleUid;
-
-  let originalRescheduledBooking = rescheduleUid
-    ? await getOriginalRescheduledBooking(rescheduleUid, !!eventType.seatsPerTimeSlot)
-    : null;
 
   let luckyUserResponse;
   let isFirstSeat = true;
@@ -803,15 +879,6 @@ async function handler(
 
   const tOrganizer = await getTranslation(organizerUser?.locale ?? "en", "common");
   const allCredentials = await getAllCredentials(organizerUser, eventType);
-
-  const { userReschedulingIsOwner, isConfirmedByDefault } = await getRequiresConfirmationFlags({
-    eventType,
-    bookingStartTime: reqBody.start,
-    userId,
-    originalRescheduledBookingOrganizerId: originalRescheduledBooking?.user?.id,
-    paymentAppData,
-    bookerEmail,
-  });
 
   // If the Organizer himself is rescheduling, the booker should be sent the communication in his timezone and locale.
   const attendeeInfoOnReschedule =
@@ -1350,6 +1417,7 @@ async function handler(
         allHostUsers: users,
         isManagedEventType,
       });
+
       booking = dryRunBooking;
       troubleshooterData = {
         ...troubleshooterData,
@@ -2013,6 +2081,9 @@ async function handler(
 
   try {
     if (!isDryRun) {
+      // Prepare data for SyncedToCalendar creation before the update call
+      const syncedToCalendarData = getSyncedToCalendarData(results);
+      console.log("syncedToCalendarData", syncedToCalendarData);
       await prisma.booking.update({
         where: {
           uid: booking.uid,
@@ -2025,11 +2096,21 @@ async function handler(
               data: referencesToCreate,
             },
           },
+          // Conditionally create SyncedToCalendar records
+          ...(syncedToCalendarData && {
+            syncedToCalendar: {
+              create: syncedToCalendarData,
+            },
+          }),
         },
       });
     }
+    // TODO: Attach bookingReferenceId as well to syncedToCalendar
   } catch (error) {
-    loggerWithEventDetails.error("Error while creating booking references", safeStringify(error));
+    loggerWithEventDetails.error(
+      "Error while updating booking references or syncedToCalendars",
+      safeStringify(error)
+    );
   }
 
   const evtWithMetadata = {

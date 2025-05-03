@@ -27,13 +27,6 @@ This plan outlines the steps to implement the Minimum Viable Product (MVP) for b
     *   Create comprehensive tests for calendar sync functionality using the mock calendar app.
     *   Test both cancellation and rescheduling flows to verify bidirectional synchronization works correctly.
 
-**Next Steps (Post-MVP / Phase 2):**
-*   Title update sync.
-*   Advanced conflict resolution.
-*   Improved error handling and monitoring.
-*   Support for other calendar providers (Outlook).
-*   User-configurable sync preferences. 
-
 TODO:
 - [x] DestinationCalendar support Google Channel related records and being updated by cron
 - [x] Add calendarEventId field to BookingReference model
@@ -85,3 +78,53 @@ MANUAL TESTING FEEDBACK:
 - Also sometimes push notifications could be delayed, maybe upto an hour in worst cases.
 - Recurring events might need to be handled differently 
 - There could be multiple destination calendars with same integration and externalId but different eventTypeIds. So, we would need to ensure same googe channel related ids for all of them(Separate tracking table as mentioned above could help with this), but we need to process for the channel only once.
+
+
+## Alternative Approaches Considered
+
+### Approach: Using `SyncedToCalendar` and `Subscription` Tables
+
+This approach proposes decoupling the calendar watching mechanism from the `DestinationCalendar` table and introducing two new tables:
+
+1.  **`SyncedToCalendar` Table:**
+    *   Stores unique combinations of `integration`, `externalId`, and `credentialId` for calendars that have had bookings synced to them.
+    *   Includes a relation field (e.g., `bookingReferences`) linking back to `BookingReference` records. This facilitates querying for cleanup by allowing easy access to all bookings associated with a specific synced calendar.
+    *   Acts as a central reference for external calendars involved in bookings.
+
+2.  **`Subscription` Table (Unified Channel Tracking):**
+    *   Implements the unified channel tracking table previously conceptualized.
+    *   Manages the actual provider subscription details (e.g., Google Channel ID, resource ID, expiry).
+    *   Links to `Credential` and references the `externalCalendarId`.
+
+3.  **`BookingReference` Modification:**
+    *   Add a foreign key (`syncedToCalendarId`) pointing to the `SyncedToCalendar` table.
+
+4.  **Cron Job Logic:**
+    *   A primary cron job (potentially separate from the existing `calendar-cache` cron) identifies active `SyncedToCalendar` entries needing a watch (e.g., based on linked future bookings).
+    *   Manages subscription creation, renewal, and deletion via the `Subscription` table based on the need identified above.
+    *   **Cleanup (Using `lastUsedAt`):** A separate, dedicated cron job is required to periodically clean up `SyncedToCalendar` and associated `Subscription` records.
+    *   **Strategy:**
+        1.  Add a `lastUsedAt: DateTime` field to the `SyncedToCalendar` model.
+        2.  Update this field to `NOW()` whenever a booking associated with the `SyncedToCalendar` record is created or updated.
+        3.  The cron job queries for `SyncedToCalendar` records where `lastUsedAt` is older than a defined threshold (e.g., 3-5 months).
+        4.  Eligible `SyncedToCalendar` records and their corresponding `Subscription` records are deleted in batches.
+    *   **Implementation:** Requires adding the field, updating booking creation/update logic, creating the cron job, and performing an initial data backfill for `lastUsedAt`.
+    *   **Limitation:** This approach prioritizes fast booking operations. As `lastUsedAt` is updated on booking activity (not based on `endTime`), the calendar watch (`Subscription`) might remain active for the duration of the threshold *after* the last associated booking has actually ended. This is considered an acceptable trade-off for performance and simplicity, as it avoids complex `endTime` recalculations during booking operations. The scenario where this causes prolonged unnecessary watching (i.e., no bookings created/updated for several months on a specific calendar) is deemed unlikely in practice.
+
+5.  **Webhook Handling:**
+    *   Incoming webhooks use the provider's subscription ID (e.g., Google Channel ID) to look up the entry in the `Subscription` table.
+    *   This links to the `externalCalendarId`, which maps to the `SyncedToCalendar` record.
+    *   Finally, use the provider's event ID (from the webhook payload) and the `syncedToCalendarId` to find the relevant `BookingReference`(s).
+
+**Pros:**
+
+*   Handles cases where users change their `DestinationCalendar` more robustly, as watches are tied to historical syncs (`SyncedToCalendar`) rather than the current setting.
+*   Implements the unified `Subscription` table, centralizing channel management and enabling potential reuse/efficiency.
+*   Normalizes external calendar identification into the `SyncedToCalendar` table.
+
+**Cons:**
+
+*   Increases architectural complexity with two new tables and modified relationships.
+*   Requires careful design of the cron job logic for managing the `Subscription` lifecycle (determining when to start/stop watching based on associated bookings), **including a separate process for cleaning up stale `SyncedToCalendar` and `Subscription` records.**
+*   Introduces an extra step in the webhook-to-booking lookup path.
+*   Requires careful consideration of indexing and potential performance impacts due to added joins and potentially large table sizes.

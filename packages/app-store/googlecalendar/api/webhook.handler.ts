@@ -5,7 +5,6 @@ import { getCredentialForCalendarCache } from "@calcom/lib/delegationCredential/
 import { HttpError } from "@calcom/lib/http-error";
 import logger from "@calcom/lib/logger";
 import { safeStringify } from "@calcom/lib/safeStringify";
-import { DestinationCalendarRepository } from "@calcom/lib/server/repository/destinationCalendar";
 import { SelectedCalendarRepository } from "@calcom/lib/server/repository/selectedCalendar";
 import prisma from "@calcom/prisma";
 
@@ -29,117 +28,190 @@ const googleHeadersSchema = z.object({
   "x-goog-resource-uri": z.string(), // https://www.googleapis.com/calendar/v3/calendars/user%40example.com/events?alt=json
 });
 
+// Use "destination" to represent calendars tracked via SyncedToCalendar
 type CalendarType = "selected" | "destination";
 
 async function getCalendarFromChannelId(channelId: string, resourceId: string) {
-  // Fetch both selected and destination calendars concurrently
-  const [selectedCalendar, destinationCalendar] = await Promise.all([
+  // 1. Query Subscription first, as it's the central point for new webhook handling
+  const subscription = await prisma.subscription.findFirst({
+    where: {
+      providerSubscriptionId: channelId,
+    },
+  });
+
+  // 2. Concurrently query SelectedCalendar and SyncedToCalendar (if subscription found)
+  const [selectedCalendar, syncedCalendars] = await Promise.all([
     SelectedCalendarRepository.findFirstByGoogleChannelIdAndResourceId(channelId, resourceId),
-    DestinationCalendarRepository.findFirstByGoogleChannelIdAndResourceId(channelId, resourceId),
+    subscription
+      ? prisma.syncedToCalendar.findMany({
+          where: { subscriptionId: subscription.id },
+          include: { credential: true }, // Include credential for later use
+        })
+      : Promise.resolve([]), // If no subscription, no synced calendars
   ]);
 
-  let calendarTypes: CalendarType[] = [];
+  const calendarTypes: CalendarType[] = [];
+  let googleCalendarId: string | null = null;
+  let credentialId: number | null = null;
+  let sourceCalendarRecordId: number | null = null; // To track which record (selected/synced) provided the info
 
-  if (selectedCalendar && destinationCalendar) {
+  log.info("selectedCalendar", safeStringify(selectedCalendar));
+  log.info("syncedCalendars", safeStringify(syncedCalendars));
+  if (selectedCalendar) {
+    calendarTypes.push("selected");
+    googleCalendarId = selectedCalendar.externalId;
+    credentialId = selectedCalendar.credentialId;
+    sourceCalendarRecordId = selectedCalendar.id;
     log.debug(
-      "Found both selected and destination calendar records",
-      safeStringify({ channelId, resourceId })
+      "Found selected calendar record",
+      safeStringify({ channelId, resourceId, selectedCalendarId: selectedCalendar.id })
     );
-    // If both are found, validate their external IDs
-    const selectedExternalId = selectedCalendar.externalId;
-    const destinationExternalId = destinationCalendar.externalId;
-
-    if (selectedExternalId !== destinationExternalId) {
-      throw new HttpError({
-        statusCode: 500, // Or 409 Conflict? 500 seems appropriate for unexpected state mismatch
-        message: `Data inconsistency: Selected calendar externalId (${selectedExternalId}) and Destination calendar externalId (${destinationExternalId}) do not match for the same channelId (${channelId}) and resourceId (${resourceId}).`,
-      });
-    }
-
-    calendarTypes = ["selected", "destination"];
-  } else if (selectedCalendar) {
-    calendarTypes = ["selected"];
-  } else if (destinationCalendar) {
-    calendarTypes = ["destination"];
   }
 
-  const calendar = selectedCalendar || destinationCalendar;
+  if (syncedCalendars.length > 0) {
+    calendarTypes.push("destination");
+    // Use the first synced calendar's info if no selected calendar was found, or verify consistency
+    const firstSynced = syncedCalendars[0];
+    if (!googleCalendarId) {
+      googleCalendarId = firstSynced.externalCalendarId;
+      credentialId = firstSynced.credentialId;
+      sourceCalendarRecordId = firstSynced.id;
+      log.debug(
+        "Using synced calendar record",
+        safeStringify({ channelId, resourceId, syncedCalendarId: firstSynced.id })
+      );
+    } else if (googleCalendarId !== firstSynced.externalCalendarId) {
+      // This case should ideally not happen if SelectedCalendar and SyncedToCalendar point to the same external resource
+      // for the *same* subscription. If it does, it indicates a potential inconsistency.
+      log.error(
+        "Data inconsistency: Selected calendar externalId and Synced calendar externalId do not match for the same subscription.",
+        safeStringify({
+          channelId,
+          resourceId,
+          selectedExternalId: googleCalendarId,
+          syncedExternalId: firstSynced.externalCalendarId,
+          selectedCalendarId: selectedCalendar?.id,
+          syncedCalendarId: firstSynced.id,
+          subscriptionId: subscription?.id,
+        })
+      );
 
-  // If no calendar record found in either repository
-  if (!calendar) {
+      throw new HttpError({
+        statusCode: 500,
+        message:
+          "Data inconsistency: Selected calendar externalId and Synced calendar externalId do not match for the same subscription.",
+      });
+    }
+    if (!credentialId) {
+      credentialId = firstSynced.credentialId;
+    } else if (credentialId !== firstSynced.credentialId) {
+      log.warn(
+        "Credential mismatch between selected and synced calendar records for the same subscription.",
+        safeStringify({
+          channelId,
+          resourceId,
+          selectedCredentialId: credentialId,
+          syncedCredentialId: firstSynced.credentialId,
+        })
+      );
+    }
+  }
+
+  // If neither selected nor synced calendars are found
+  if (calendarTypes.length === 0) {
+    log.warn(
+      "No selected or synced calendar records found for subscription",
+      safeStringify({ channelId, resourceId, subscriptionId: subscription?.id })
+    );
     return {
       calendarService: null,
       googleCalendarId: null,
       calendarTypes,
+      subscriptionId: subscription?.id ?? null, // Return subscriptionId if found
     };
   }
 
-  // Process the prioritized calendar record to get the service and common googleCalendarId
-  // Note: 'id' from prioritizedCalendar is only used for logging/error messages now
-  const { credential, externalId: googleCalendarId } = calendar;
-
-  if (!credential) {
+  // Ensure we have a credential ID to proceed
+  if (!credentialId) {
+    // This should theoretically not happen if calendarTypes is not empty
+    log.error(
+      "Logical error: Found calendar types but no credential ID.",
+      safeStringify({
+        channelId,
+        resourceId,
+        calendarTypes,
+        sourceCalendarRecordId,
+        subscriptionId: subscription?.id,
+      })
+    );
     throw new HttpError({
-      statusCode: 404,
-      message: `No credential found for ${calendarType} calendar (ID: ${calendarId}) for googleChannelId: ${channelId}, resourceId: ${resourceId}`,
+      statusCode: 500,
+      message: `Internal error: Could not determine credential for calendar processing (Channel: ${channelId}, Resource: ${resourceId}).`,
     });
   }
 
-  const credentialForCalendarCache = await getCredentialForCalendarCache({ credentialId: credential.id });
-  const calendarService = (await getCalendar(credentialForCalendarCache)) as GoogleCalendarService | null; // Cast to access specific methods
+  // Fetch the credential using the determined credentialId
+  const credentialForCalendarCache = await getCredentialForCalendarCache({ credentialId: credentialId });
+  if (!credentialForCalendarCache) {
+    // Throw specific error if credential fetch fails
+    throw new HttpError({
+      statusCode: 404, // Or 500 if credential should always exist here
+      message: `No credential found for credentialId: ${credentialId} (associated with ${calendarTypes.join(
+        " & "
+      )} calendar, source ID: ${sourceCalendarRecordId}, Channel: ${channelId}, Resource: ${resourceId})`,
+    });
+  }
+
+  const calendarService = (await getCalendar(credentialForCalendarCache)) as GoogleCalendarService | null;
 
   if (!calendarService) {
+    // Throw error if calendar service initialization fails
     throw new HttpError({
-      statusCode: 404,
-      message: `No calendar service found for credential: ${credential.id}`,
+      statusCode: 500, // Service init failure is likely an internal issue
+      message: `Failed to initialize calendar service for credential: ${credentialId}`,
     });
   }
 
   return {
     calendarService,
-    googleCalendarId,
+    googleCalendarId, // This is the crucial external ID for the Google API call
     calendarTypes,
+    subscriptionId: subscription?.id ?? null, // Pass subscription ID for potential updates
   };
 }
 
 export async function postHandler(req: NextApiRequest) {
-  try {
-    const {
-      "x-goog-channel-token": channelToken,
-      "x-goog-channel-id": channelId,
-      "x-goog-resource-id": resourceId,
-      /**
-       * 'exists' - Event exists and is changed
-       * 'not_found' - Event is deleted
-       * 'sync' - Initial sync when someone subscribes to the channel
-       */
-      "x-goog-resource-state": resourceState,
-    } = googleHeadersSchema.parse(req.headers);
+  let channelId: string | undefined;
+  let resourceId: string | undefined;
+  let subscriptionId: number | null = null; // Initialize subscriptionId
 
-    // log.debug(
-    //   "Webhook received",
-    //   safeStringify({
-    //     channelToken,
-    //     channelId,
-    //     resourceId,
-    //     resourceState,
-    //     messageNumber: req.headers["x-goog-message-number"],
-    //     timestamp: new Date().toISOString(),
-    //   })
-    // );
+  try {
+    const parsedHeaders = googleHeadersSchema.parse(req.headers);
+    channelId = parsedHeaders["x-goog-channel-id"];
+    resourceId = parsedHeaders["x-goog-resource-id"];
+    const channelToken = parsedHeaders["x-goog-channel-token"];
+    const resourceState = parsedHeaders["x-goog-resource-state"];
 
     if (channelToken !== process.env.GOOGLE_WEBHOOK_TOKEN) {
       throw new HttpError({ statusCode: 403, message: "Invalid API key" });
     }
-    if (!channelId) {
-      throw new HttpError({ statusCode: 403, message: "Missing Channel ID" });
+    // channelId and resourceId are validated by schema parsing now
+    if (channelId !== "cb5b3f92-b570-425b-9ae2-67d6608fff2b") {
+      // prevent spam while testing
+      return { message: "ok" };
     }
+    const calendarInfo = await getCalendarFromChannelId(channelId, resourceId);
+    log.info("calendarInfo", safeStringify(calendarInfo));
+    subscriptionId = calendarInfo.subscriptionId; // Store subscriptionId for potential update/logging
 
-    const { calendarService, googleCalendarId, calendarTypes, destinationCalendarId } =
-      await getCalendarFromChannelId(channelId, resourceId);
+    const { calendarService, googleCalendarId, calendarTypes } = calendarInfo;
 
     if (!googleCalendarId || calendarTypes.length === 0) {
-      return { message: "no record found attached with this channelId and resourceId" };
+      // Log already happened in getCalendarFromChannelId
+      // Consider stopping the watch if no records found? Maybe handled elsewhere.
+      return {
+        message: `No active selected or synced calendar records found for channelId ${channelId} and resourceId ${resourceId}. Subscription ID: ${subscriptionId}`,
+      };
     }
 
     // Now we have the actual Google Calendar ID (googleCalendarId) and the resourceId
@@ -151,61 +223,96 @@ export async function postHandler(req: NextApiRequest) {
         resourceId,
         resourceState,
         channelId,
+        subscriptionId, // Add subscriptionId to logs
         messageNumber: req.headers["x-goog-message-number"],
       })
     );
 
     if (!calendarService?.onWatchedCalendarChange) {
-      throw new HttpError({ statusCode: 404, message: "Calendar does not support onWatchedCalendarChange" });
+      // Log error with more context
+      log.error(
+        "Calendar service does not support onWatchedCalendarChange",
+        safeStringify({
+          credentialId: calendarService?.credential.id,
+          calendarTypes,
+          googleCalendarId,
+          channelId,
+          resourceId,
+          subscriptionId,
+        })
+      );
+      throw new HttpError({
+        statusCode: 501,
+        message: "Calendar service does not support onWatchedCalendarChange",
+      }); // 501 Not Implemented might be suitable
     }
 
-    // Pass the correct Google Calendar ID, resourceId, resourceState and the current calendarType
+    // Pass the correct Google Calendar ID, resourceId, resourceState and the relevant calendarTypes
     await calendarService.onWatchedCalendarChange(googleCalendarId, resourceId, resourceState, calendarTypes);
+
     log.debug(
-      `Successfully processed webhook for type: ${calendarTypes}`,
+      `Successfully processed webhook for type(s): ${calendarTypes.join(", ")}`,
       safeStringify({
         calendarTypes,
         googleCalendarId,
         resourceId,
         channelId,
+        subscriptionId, // Add subscriptionId to logs
         messageNumber: req.headers["x-goog-message-number"],
       })
     );
 
-    // Update lastProcessedTime only if a destination calendar was involved
-    if (calendarTypes.includes("destination") && destinationCalendarId !== null) {
+    // Update Subscription.lastSyncAt if a subscription was identified and processing was successful
+    if (subscriptionId !== null) {
       try {
-        await prisma.destinationCalendar.updateMany({
-          where: {
-            integration: "google_calendar",
-            externalId: googleCalendarId,
-          },
-          data: {
-            lastProcessedTime: new Date(),
-          },
+        await prisma.subscription.update({
+          where: { id: subscriptionId },
+          data: { lastSyncAt: new Date() }, // Update last sync time
         });
         log.debug(
-          "Updated lastProcessedTime for destination calendar",
-          safeStringify({ destinationCalendarId, resourceId })
+          "Updated lastSyncAt for subscription",
+          safeStringify({ subscriptionId, resourceId, channelId })
         );
       } catch (error) {
         log.error(
-          "Failed to update lastProcessedTime for destination calendar",
+          "Failed to update lastSyncAt for subscription",
           safeStringify(error),
-          safeStringify({ destinationCalendarId, resourceId })
+          safeStringify({ subscriptionId, resourceId, channelId })
         );
+        // Decide if this failure should impact the overall response (e.g., return 500?)
+        // For now, log the error but return "ok" as the primary webhook logic succeeded.
       }
+    } else {
+      // This case might occur if only a selectedCalendar was found without a corresponding new Subscription record yet.
+      // This might be expected during transition or if selectedCalendars don't always have a linked Subscription.
+      log.info(
+        "No subscription ID found to update lastSyncAt, likely processing for SelectedCalendar only.",
+        safeStringify({ channelId, resourceId, calendarTypes })
+      );
     }
+
+    // REMOVED: prisma.destinationCalendar.updateMany block
+
     return { message: "ok" };
   } catch (error) {
+    // Log with context if available
+    const context = { channelId, resourceId, subscriptionId };
     if (error instanceof z.ZodError) {
-      log.error("Invalid webhook headers", safeStringify({ error: error.errors, headers: req.headers }));
+      log.error(
+        "Invalid webhook headers",
+        safeStringify({ error: error.errors, headers: req.headers, context })
+      );
       throw new HttpError({ statusCode: 400, message: "Invalid request headers" });
     }
     if (error instanceof HttpError) {
+      // Log HttpErrors with context before re-throwing
+      log.error(
+        `HttpError processing webhook: ${error.message}`,
+        safeStringify({ statusCode: error.statusCode, context })
+      );
       throw error;
     }
-    log.error("Unexpected error processing webhook", safeStringify({ error }));
+    log.error("Unexpected error processing webhook", safeStringify(error), safeStringify({ context }));
     throw new HttpError({ statusCode: 500, message: "Internal server error" });
   }
 }
